@@ -3,15 +3,17 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "rewrites": [
-    { "source": "/config", "destination": "/api/config" },
-    { "source": "/time", "destination": "/api/time" },
-    { "source": "/symbols", "destination": "/api/symbols" },
-    { "source": "/history", "destination": "/api/history" },
-    { "source": "/search", "destination": "/api/search" },
-    { "source": "/quotes", "destination": "/api/quotes" },
-    { "source": "/instruments", "destination": "/api/instruments" },
-    { "source": "/trade/:path*", "destination": "/api/trade/:path*" },
-    { "source": "/bundles/:path*", "destination": "/api/cdn?path=bundles/:path*" },
-    { "source": "/charting_library/:path*", "destination": "/api/cdn?path=charting_library/:path*" }
+    { "source": "/config", "destination": "/api?route=config" },
+    { "source": "/time", "destination": "/api?route=time" },
+    { "source": "/symbols", "destination": "/api?route=symbols" },
+    { "source": "/history", "destination": "/api?route=history" },
+    { "source": "/search", "destination": "/api?route=search" },
+    { "source": "/quotes", "destination": "/api?route=quotes" },
+    { "source": "/instruments", "destination": "/api?route=instruments" },
+    { "source": "/trade/:subpath*", "destination": "/api?route=trade&subpath=:subpath*" },
+    { "source": "/bundles/:path*", "destination": "/api?route=cdn&path=bundles/:path*" },
+    { "source": "/charting_library/:path*", "destination": "/api?route=cdn&path=charting_library/:path*" },
+    { "source": "/api/cdn", "destination": "/api?route=cdn" },
+    { "source": "/api/:route*", "destination": "/api?route=:route*" }
   ]
 }
