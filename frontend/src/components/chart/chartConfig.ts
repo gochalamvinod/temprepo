@@ -64,13 +64,16 @@ function createUniversalDatafeed(datafeedUrl: string) {
           const sym = params?.symbol || 'XAUUSD';
           const m = resolveSymbolMetaSync(sym);
           const pricescale = Math.pow(10, m.displayPrecision);
+          const symUpper = sym.toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const isCrypto = symUpper.startsWith('BTC') || symUpper.startsWith('ETH') || symUpper.startsWith('LTC') || symUpper.startsWith('SOL');
+          const session = isCrypto ? '24x7' : '2200-2200:12345';
           return {
             name: m.symbol,
             ticker: m.symbol,
             full_name: `OANDA:${m.symbol}`,
             description: `${m.displayName} (${m.type})`,
             type: m.type === 'CURRENCY' ? 'forex' : 'cfd',
-            session: '24x7',
+            session,
             timezone: 'Etc/UTC',
             exchange: 'OANDA',
             listed_exchange: 'OANDA',
@@ -160,8 +163,13 @@ function createUniversalDatafeed(datafeedUrl: string) {
       base.resolveSymbol(
         symbolName,
         (info: any) => {
+          const symUpper = (symbolName || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const isCrypto = symUpper.startsWith('BTC') || symUpper.startsWith('ETH') || symUpper.startsWith('LTC') || symUpper.startsWith('SOL');
+          const session = isCrypto ? '24x7' : '2200-2200:12345';
           onResolved({
             ...info,
+            session,
+            timezone: 'Etc/UTC',
             has_intraday: true,
             intraday_multipliers: ['1', '2', '3', '4', '5', '10', '15', '30', '45', '60', '120', '180', '240'],
             has_seconds: true,
@@ -303,6 +311,7 @@ export function getWidgetOptions(
   saveLoadAdapter?: any,
   defaultSymbol: string = '',       // Fetched from server, never hardcoded
   watchlistSymbols: string[] = [],   // Fetched from server /instruments
+  savedData?: any
 ): WidgetOptions {
   return {
     container,
@@ -317,6 +326,9 @@ export function getWidgetOptions(
     custom_css_url: "/custom.css",
     numeric_formatting: { decimal_sign: "." },
     save_load_adapter: saveLoadAdapter,
+    saved_data: savedData || undefined,
+    auto_save_delay: 2,
+    load_last_chart: true,
 
     broker_factory: brokerFactory,
     broker_config: {

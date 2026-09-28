@@ -32,6 +32,7 @@ export interface ChartWidget {
   resolution(): string;
   onIntervalChanged(): { subscribe: (id: any, callback: Function) => void };
   onSymbolResolved(): { subscribe: (id: any, callback: Function) => void };
+  onSymbolChanged?(): { subscribe: (id: any, callback: Function) => void };
   createStudy(name: string, isOverlay?: boolean, lock?: boolean, inputs?: any[], overrides?: any): Promise<string>;
   getAllStudies(): Array<{ id: string; name: string }>;
   removeEntity(id: string): void;
@@ -50,6 +51,7 @@ declare global {
       createButton(options: { align: string; useTradingViewStyle?: boolean }): HTMLElement;
       save(callback: (state: object) => void): void;
       load(state: object): void;
+      subscribe(event: string, callback: Function): void;
       changeTheme(theme: 'Dark' | 'Light'): void;
       activeChart(): ChartWidget;
       remove(): void;

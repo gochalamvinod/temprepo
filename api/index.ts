@@ -112,7 +112,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         full_name: `OANDA:${disp}`,
         description: `${inst.displayName} (${inst.type})`,
         type: inst.type === 'CURRENCY' ? 'forex' : 'cfd',
-        session: '24x7',
+        session: (disp.startsWith('BTC') || disp.startsWith('ETH') || disp.startsWith('LTC') || disp.startsWith('SOL')) ? '24x7' : '2200-2200:12345',
         timezone: 'Etc/UTC',
         exchange: 'OANDA',
         listed_exchange: 'OANDA',

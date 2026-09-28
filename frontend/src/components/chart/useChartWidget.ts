@@ -2,6 +2,11 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { getWidgetOptions } from './chartConfig';
 import { DEFAULT_WATCHLIST, fetchInstruments } from '../../services/oandaClient';
 import { bindTradingViewClock } from '../../lib/serverTimeSync';
+import {
+  LocalStorageSaveLoadAdapter,
+  getSavedChartState,
+  saveActiveChartState,
+} from '../../lib/saveLoadAdapter';
 
 export function useChartWidget(
   containerId: string,
@@ -25,23 +30,23 @@ export function useChartWidget(
       return;
     }
 
-    try {
-      localStorage.removeItem('tv_layout_state');
-    } catch {}
-
     // Pre-warm full OANDA instruments catalog in background without blocking 0ms widget boot
     fetchInstruments().catch(() => {});
 
     setIsLoading(false);
+
+    const adapter = saveLoadAdapter || new LocalStorageSaveLoadAdapter();
+    const savedChartData = getSavedChartState();
 
     const options = getWidgetOptions(
       containerId,
       datafeedUrl,
       theme,
       brokerFactory,
-      saveLoadAdapter,
+      adapter,
       'XAUUSD',
-      DEFAULT_WATCHLIST
+      DEFAULT_WATCHLIST,
+      savedChartData
     );
 
     const widget = new window.TradingView.widget(options);
@@ -49,10 +54,49 @@ export function useChartWidget(
     (window as any).tvWidget = widget;
     bindTradingViewClock(containerId);
 
+    // Auto-save debounced handler for all user drawings and layout changes
+    let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+    const triggerSave = () => {
+      if (saveTimeout) clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(() => {
+        try {
+          if (widget && typeof widget.save === 'function') {
+            widget.save((state: any) => {
+              if (state) {
+                saveActiveChartState(state);
+              }
+            });
+          }
+        } catch (e) {
+          console.warn('Auto-save failed', e);
+        }
+      }, 500);
+    };
+
+    const triggerSaveSync = () => {
+      try {
+        if (widget && typeof widget.save === 'function') {
+          widget.save((state: any) => {
+            if (state) {
+              saveActiveChartState(state);
+            }
+          });
+        }
+      } catch {}
+    };
+
+    // Save on tab close, page refresh, or visibility change
+    window.addEventListener('beforeunload', triggerSaveSync);
+    const onVisibilityChange = () => {
+      if (document.hidden) triggerSaveSync();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
     widget.onChartReady(() => {
       if (!cancelled) {
         (window as any).tvWidget = widget;
         bindTradingViewClock(containerId);
+
         const stripLogoWatermark = () => {
           try {
             const chartObj = (widget as any).activeChart?.();
@@ -68,16 +112,36 @@ export function useChartWidget(
         };
         stripLogoWatermark();
         setTimeout(stripLogoWatermark, 500);
+
+        // Auto-save triggers on any user chart interaction or drawing
         try {
-          widget.activeChart().removeAllShapes();
+          widget.subscribe('onAutoSaveNeeded', triggerSave);
         } catch {}
 
+        try {
+          const chart = widget.activeChart();
+          chart.onIntervalChanged?.().subscribe(null, triggerSave);
+          chart.onSymbolResolved?.().subscribe(null, triggerSave);
+          (chart as any).onSymbolChanged?.().subscribe(null, triggerSave);
+        } catch {}
+
+        // Periodic auto-save every 5 seconds to guarantee drawing persistence
+        const periodicSaveInterval = setInterval(triggerSave, 5000);
+
         setIsReady(true);
+
+        return () => {
+          clearInterval(periodicSaveInterval);
+        };
       }
     });
 
     return () => {
       cancelled = true;
+      triggerSaveSync();
+      window.removeEventListener('beforeunload', triggerSaveSync);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (saveTimeout) clearTimeout(saveTimeout);
       if (widgetRef.current) {
         try {
           widgetRef.current.remove();
@@ -96,8 +160,20 @@ export function useChartWidget(
     }
   }, [theme, isReady]);
 
-  const saveLayout = useCallback(() => {}, []);
-  const loadLayout = useCallback(() => {}, []);
+  const saveLayout = useCallback(() => {
+    if (widgetRef.current && typeof widgetRef.current.save === 'function') {
+      widgetRef.current.save((state: any) => {
+        if (state) saveActiveChartState(state);
+      });
+    }
+  }, []);
+
+  const loadLayout = useCallback(() => {
+    const saved = getSavedChartState();
+    if (saved && widgetRef.current && typeof widgetRef.current.load === 'function') {
+      widgetRef.current.load(saved);
+    }
+  }, []);
 
   return { widgetRef, isReady, isLoading, chartActions: { saveLayout, loadLayout } };
 }
