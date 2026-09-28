@@ -1,20 +1,11 @@
 import { OANDA_ACCOUNT_ID, OANDA_API_TOKEN, OANDA_BASE_URL } from '../services/oandaClient';
 
 /**
- * Sub-1ms High-Precision Server Time Synchronization Engine (NTP Minimum-Delay Filter)
+ * Sub-1ms High-Precision OANDA Server Time Synchronization Engine
  *
- * Anchors the browser's microsecond-resolution monotonic clock (`performance.now()`)
- * to the server's UTC clock using Cristian's algorithm + NTP minimum-RTT filtering:
- *
- *   t0 = performance.now()
- *   fetch('/time' or OANDA nanosecond pricing time) -> serverTimeMs (sub-ms float)
- *   t1 = performance.now()
- *   rtt = t1 - t0
- *   midpointPerfNow = (t0 + t1) / 2
- *   perfOffset = serverTimeMs - midpointPerfNow
- *
- * At any subsequent moment:
- *   calibratedServerMs = performance.now() + perfOffset
+ * Uses Cristian's algorithm + NTP Minimum-Delay Filtering anchored to the browser's
+ * microsecond monotonic clock (`performance.now()`), continuously calibrated against
+ * OANDA's nanosecond RFC3339 pricing clock (`"time": "2026-09-28T08:08:20.115244503Z"`).
  */
 
 interface SyncSample {
@@ -23,7 +14,7 @@ interface SyncSample {
   timestamp: number;
 }
 
-const MAX_SAMPLES = 8;
+const MAX_SAMPLES = 10;
 const samples: SyncSample[] = [];
 
 let _perfOffset = Date.now() - performance.now();
@@ -31,10 +22,23 @@ let _isSynced = false;
 let _bestRtt = Infinity;
 let _syncCount = 0;
 let _intervalId: ReturnType<typeof setInterval> | null = null;
+let _syncResolvers: Array<() => void> = [];
 
-function recordSample(serverMs: number, t0: number, t1: number): void {
+/** Parse OANDA RFC3339 nanosecond timestamp into float milliseconds */
+export function parseOandaTimeMs(isoStr: string): number {
+  const baseMs = new Date(isoStr).getTime();
+  if (isNaN(baseMs)) return NaN;
+  const fracMatch = isoStr.match(/\.(\d+)Z$/);
+  let subMs = 0;
+  if (fracMatch && fracMatch[1].length > 3) {
+    subMs = parseFloat('0.' + fracMatch[1].slice(3));
+  }
+  return baseMs + subMs;
+}
+
+export function recordSample(serverMs: number, t0: number, t1: number): void {
   if (isNaN(serverMs) || serverMs <= 0) return;
-  const rtt = t1 - t0;
+  const rtt = Math.max(0.1, t1 - t0);
   const midpointPerf = (t0 + t1) / 2;
   const samplePerfOffset = serverMs - midpointPerf;
 
@@ -47,7 +51,7 @@ function recordSample(serverMs: number, t0: number, t1: number): void {
     samples.shift();
   }
 
-  // NTP Clock Filter: sort samples by RTT ascending and weight lowest-RTT samples
+  // NTP Minimum-Delay Filter: sort by RTT ascending and weight the lowest-RTT samples
   const sorted = [...samples].sort((a, b) => a.rtt - b.rtt);
   const bestCount = Math.min(3, sorted.length);
   let weightedSum = 0;
@@ -63,44 +67,27 @@ function recordSample(serverMs: number, t0: number, t1: number): void {
   _bestRtt = sorted[0].rtt;
   _isSynced = true;
   _syncCount++;
+
+  if (_syncResolvers.length > 0) {
+    const resolvers = _syncResolvers.splice(0, _syncResolvers.length);
+    resolvers.forEach(r => r());
+  }
 }
 
-/** Perform a single NTP-style probe against /time (with direct OANDA nanosecond fallback) */
+/** Feed an OANDA RFC3339 nanosecond timestamp directly into the NTP filter */
+export function recordOandaTimestamp(isoStr: string, t0: number, t1: number): void {
+  const serverMs = parseOandaTimeMs(isoStr);
+  if (!isNaN(serverMs)) {
+    recordSample(serverMs, t0, t1);
+  }
+}
+
+/** Perform a direct NTP-style probe against OANDA's nanosecond pricing clock */
 async function probe(): Promise<void> {
   try {
     const t0 = performance.now();
-    const resp = await fetch(`/time?_=${t0}`, {
-      cache: 'no-store',
-      headers: { 'Cache-Control': 'no-cache' },
-    });
-    const t1 = performance.now();
-
-    if (resp.ok) {
-      const contentType = resp.headers.get('content-type') || '';
-      if (contentType.includes('json') || contentType.includes('text/plain')) {
-        const headerMs = resp.headers.get('X-Server-Time-Ms');
-        const bodyVal = await resp.json();
-        const serverMs = headerMs && !isNaN(parseFloat(headerMs))
-          ? parseFloat(headerMs)
-          : (typeof bodyVal === 'object' && bodyVal !== null
-              ? (bodyVal.ms ?? (bodyVal.time ? bodyVal.time * 1000 : NaN))
-              : parseFloat(bodyVal) * 1000);
-
-        if (!isNaN(serverMs) && serverMs > 0) {
-          recordSample(serverMs, t0, t1);
-          return;
-        }
-      }
-    }
-  } catch {
-    // Fall through to direct OANDA nanosecond clock probe
-  }
-
-  // Direct OANDA nanosecond clock probe (returns RFC3339 with nanosecond fraction)
-  try {
-    const t0 = performance.now();
     const res = await fetch(
-      `${OANDA_BASE_URL}/v3/accounts/${OANDA_ACCOUNT_ID}/pricing?instruments=EUR_USD`,
+      `${OANDA_BASE_URL}/v3/accounts/${OANDA_ACCOUNT_ID}/pricing?instruments=XAU_USD`,
       {
         cache: 'no-store',
         headers: {
@@ -110,37 +97,58 @@ async function probe(): Promise<void> {
       }
     );
     const t1 = performance.now();
-    if (!res.ok) return;
-    const data = await res.json();
-    if (data && typeof data.time === 'string') {
-      // Parse sub-millisecond fraction from e.g. "2026-09-28T06:37:16.132213412Z"
-      const baseMs = new Date(data.time).getTime();
-      const fracMatch = data.time.match(/\.(\d+)Z$/);
-      let subMs = 0;
-      if (fracMatch && fracMatch[1].length > 3) {
-        subMs = parseFloat('0.' + fracMatch[1].slice(3));
+    if (res.ok) {
+      const data = await res.json();
+      if (data && typeof data.time === 'string') {
+        recordOandaTimestamp(data.time, t0, t1);
+        return;
       }
-      recordSample(baseMs + subMs, t0, t1);
+    }
+  } catch {
+    // Fallback to /time endpoint if direct OANDA probe fails
+  }
+
+  try {
+    const t0 = performance.now();
+    const resp = await fetch(`/time?_=${t0}`, { cache: 'no-store' });
+    const t1 = performance.now();
+    if (resp.ok) {
+      const headerMs = resp.headers.get('X-Server-Time-Ms');
+      const bodyVal = await resp.json();
+      const serverMs = headerMs && !isNaN(parseFloat(headerMs))
+        ? parseFloat(headerMs)
+        : parseFloat(bodyVal) * 1000;
+      if (!isNaN(serverMs) && serverMs > 0) {
+        recordSample(serverMs, t0, t1);
+      }
     }
   } catch {
     // Keep existing calibrated offset
   }
 }
 
-/** Start background sync (5 rapid burst probes at init for <1ms convergence, then every 20s) */
+/** Wait until at least one NTP sample has been calibrated (with 800ms safety timeout) */
+export function waitForInitialSync(): Promise<void> {
+  if (_isSynced) return Promise.resolve();
+  return new Promise<void>(resolve => {
+    _syncResolvers.push(resolve);
+    setTimeout(resolve, 800);
+  });
+}
+
+/** Start background sync (5 rapid burst probes at init for <1ms convergence, then every 15s) */
 export function startSync(): void {
   if (_intervalId) return;
 
   probe();
-  setTimeout(probe, 150);
-  setTimeout(probe, 350);
-  setTimeout(probe, 700);
-  setTimeout(probe, 1200);
+  setTimeout(probe, 120);
+  setTimeout(probe, 300);
+  setTimeout(probe, 600);
+  setTimeout(probe, 1000);
 
-  _intervalId = setInterval(probe, 20_000);
+  _intervalId = setInterval(probe, 15_000);
 }
 
-/** Stop background sync */
 export function stopSync(): void {
   if (_intervalId) {
     clearInterval(_intervalId);
@@ -148,12 +156,12 @@ export function stopSync(): void {
   }
 }
 
-/** Get calibrated server time in epoch MILLISECONDS (sub-1ms precision) */
+/** Get calibrated OANDA server time in epoch MILLISECONDS (sub-1ms precision) */
 export function getCalibratedServerTimeMs(): number {
   return performance.now() + _perfOffset;
 }
 
-/** Get calibrated server time in epoch SECONDS (for TradingView getServerTime callback) */
+/** Get calibrated OANDA server time in epoch SECONDS (float) */
 export function getCalibratedServerTimeSec(): number {
   return (performance.now() + _perfOffset) / 1000;
 }
@@ -163,12 +171,10 @@ export function getOffset(): number {
   return getCalibratedServerTimeMs() - Date.now();
 }
 
-/** Check if at least one sync has completed */
 export function isSynced(): boolean {
   return _isSynced;
 }
 
-/** Get sync stats for debugging */
 export function getSyncStats() {
   return {
     offsetMs: getOffset(),
@@ -178,13 +184,38 @@ export function getSyncStats() {
   };
 }
 
-if (typeof window !== 'undefined') {
-  (window as any).__SERVER_TIME_SYNC__ = {
-    getCalibratedServerTimeMs,
-    getCalibratedServerTimeSec,
-    getOffset,
-    isSynced,
-    getSyncStats,
-  };
-}
+/**
+ * Bind TradingView's internal ChartApiInstance._studyEngine directly to our
+ * sub-1ms calibrated OANDA clock so the chart's bottom-right UTC clock,
+ * bar countdown timer, and session aligner never drift from OANDA server time.
+ */
+export function bindTradingViewClock(containerId: string): void {
+  const tryBind = () => {
+    try {
+      const container = document.getElementById(containerId);
+      const iframe = container?.querySelector('iframe') as HTMLIFrameElement | null;
+      const win = (iframe?.contentWindow || window) as any;
+      const chartApi = win?.ChartApiInstance;
+      const engine = chartApi?._studyEngine;
 
+      if (engine) {
+        const offsetSec = (getCalibratedServerTimeMs() - Date.now()) / 1000;
+        engine._serverTimeOffset = offsetSec;
+        engine.serverTimeOffset = () => (getCalibratedServerTimeMs() - Date.now()) / 1000;
+        engine.getCurrentUTCTime = () => getCalibratedServerTimeSec();
+        engine.serverTime = () => getCalibratedServerTimeMs();
+      }
+      if (chartApi) {
+        chartApi.serverTimeOffset = () => (getCalibratedServerTimeMs() - Date.now()) / 1000;
+        chartApi.serverTime = () => getCalibratedServerTimeMs();
+      }
+    } catch {
+      // Ignore cross-frame timing errors during init
+    }
+  };
+
+  tryBind();
+  setTimeout(tryBind, 300);
+  setTimeout(tryBind, 1000);
+  setInterval(tryBind, 5000);
+}

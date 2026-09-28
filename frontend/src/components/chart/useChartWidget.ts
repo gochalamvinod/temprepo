@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { getWidgetOptions } from './chartConfig';
 import { DEFAULT_WATCHLIST, fetchInstruments } from '../../services/oandaClient';
+import { bindTradingViewClock } from '../../lib/serverTimeSync';
 
 export function useChartWidget(
   containerId: string,
@@ -46,10 +47,12 @@ export function useChartWidget(
     const widget = new window.TradingView.widget(options);
     widgetRef.current = widget;
     (window as any).tvWidget = widget;
+    bindTradingViewClock(containerId);
 
     widget.onChartReady(() => {
       if (!cancelled) {
         (window as any).tvWidget = widget;
+        bindTradingViewClock(containerId);
         const stripLogoWatermark = () => {
           try {
             const chartObj = (widget as any).activeChart?.();

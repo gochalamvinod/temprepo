@@ -1,6 +1,11 @@
+import { getCalibratedServerTimeSec, recordOandaTimestamp } from '../lib/serverTimeSync';
+
 /**
- * Ultra-Fast Direct OANDA v20 Engine (Sub-1ms In-Memory Symbol Resolution + Direct REST Streaming)
- * Credentials hardcoded directly as requested.
+ * Ultra-Fast Direct OANDA v20 Engine
+ * - Hardcoded OANDA practice credentials
+ * - Exact timestamp alignment for Ticks (1T, 3T, 10T), Seconds (1S, 3S, 5S, 10S, 15S, 30S),
+ *   Minutes (1, 2, 3, 4, 5, 10, 15, 30, 45), Hours (60, 120, 180, 240), and D/W/M
+ * - Never emits future timestamps ahead of calibrated OANDA server clock
  */
 
 export const OANDA_ACCOUNT_ID = '101-001-40395350-001';
@@ -21,10 +26,10 @@ export const DEFAULT_WATCHLIST = [
 ];
 
 export interface InstrumentMeta {
-  name: string;         // e.g. "XAU_USD"
-  symbol: string;       // e.g. "XAUUSD"
-  displayName: string;  // e.g. "XAU/USD"
-  type: string;         // "CURRENCY" | "METAL" | "CFD"
+  name: string;
+  symbol: string;
+  displayName: string;
+  type: string;
   displayPrecision: number;
   pipLocation: number;
   minimumTradeSize: string;
@@ -32,7 +37,6 @@ export interface InstrumentMeta {
   marginRate: string;
 }
 
-// Pre-seeded instant symbol table for 0ms synchronous symbol resolution
 const INSTANT_META: Record<string, InstrumentMeta> = {
   XAU_USD: { name: 'XAU_USD', symbol: 'XAUUSD', displayName: 'Gold (XAU/USD)', type: 'METAL', displayPrecision: 3, pipLocation: -1, minimumTradeSize: '1', maximumOrderUnits: '10000', marginRate: '0.05' },
   XAG_USD: { name: 'XAG_USD', symbol: 'XAGUSD', displayName: 'Silver (XAG/USD)', type: 'METAL', displayPrecision: 3, pipLocation: -3, minimumTradeSize: '1', maximumOrderUnits: '50000', marginRate: '0.10' },
@@ -64,11 +68,16 @@ for (const meta of Object.values(INSTANT_META)) {
 let instrumentsCache: InstrumentMeta[] | null = null;
 let instrumentsPromise: Promise<InstrumentMeta[]> | null = null;
 
-// Ultra-fast in-memory history cache (1000ms TTL)
+// In-flight deduplication and short TTL cache so 10ms UDF polling never floods OANDA
+const inFlightHistory = new Map<string, Promise<any>>();
 const historyCache = new Map<string, { ts: number; data: any }>();
+
+// Live price cache per symbol for instant real-time bar updates
+export const latestQuoteMap = new Map<string, { lp: number; bid: number; ask: number; timeMs: number }>();
 
 export async function oandaRequest(path: string, options: RequestInit = {}): Promise<any> {
   const url = `${OANDA_BASE_URL}${path.replace(/\{id\}/g, OANDA_ACCOUNT_ID)}`;
+  const t0 = performance.now();
   const res = await fetch(url, {
     ...options,
     headers: {
@@ -78,11 +87,16 @@ export async function oandaRequest(path: string, options: RequestInit = {}): Pro
       ...(options.headers as Record<string, string> || {}),
     },
   });
+  const t1 = performance.now();
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`OANDA API ${res.status}: ${text}`);
   }
-  return res.json();
+  const data = await res.json();
+  if (data && typeof data.time === 'string') {
+    recordOandaTimestamp(data.time, t0, t1);
+  }
+  return data;
 }
 
 export function toDisplaySymbol(oandaName: string): string {
@@ -150,7 +164,23 @@ export function translateResolution(resolution: string): string {
   }
 }
 
-/** 0ms synchronous symbol resolution for instant chart startup */
+/** Return the exact duration in seconds of a resolution for bar boundary alignment */
+export function getResolutionSeconds(resolution: string): number {
+  const r = resolution.trim().toUpperCase();
+  if (r === '1T' || r === '1S') return 1;
+  if (r === '3T' || r === '3S') return 3;
+  if (r === '5T' || r === '5S') return 5;
+  if (r === '10T' || r === '10S') return 10;
+  if (r === '15T' || r === '15S') return 15;
+  if (r === '30T' || r === '30S') return 30;
+  if (r === 'D' || r === '1D') return 86400;
+  if (r === 'W' || r === '1W') return 604800;
+  if (r === 'M' || r === '1M') return 2592000;
+  const mins = parseInt(r, 10);
+  if (!isNaN(mins) && mins > 0) return mins * 60;
+  return 60;
+}
+
 export function resolveSymbolMetaSync(symbol: string): InstrumentMeta {
   const oandaSym = toOandaSymbol(symbol);
   const hit = instrumentsMap.get(oandaSym) || instrumentsMap.get(toDisplaySymbol(oandaSym));
@@ -223,6 +253,32 @@ export async function fetchInstruments(): Promise<InstrumentMeta[]> {
   return instrumentsPromise;
 }
 
+interface RawBar {
+  t: number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+}
+
+function aggregateBars(bars: RawBar[], bucketSec: number): RawBar[] {
+  const out: RawBar[] = [];
+  for (const b of bars) {
+    const alignedT = Math.floor(b.t / bucketSec) * bucketSec;
+    const last = out[out.length - 1];
+    if (last && last.t === alignedT) {
+      last.h = Math.max(last.h, b.h);
+      last.l = Math.min(last.l, b.l);
+      last.c = b.c;
+      last.v += b.v;
+    } else {
+      out.push({ t: alignedT, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v });
+    }
+  }
+  return out;
+}
+
 export async function fetchOandaHistory(
   symbol: string,
   resolution: string,
@@ -231,104 +287,177 @@ export async function fetchOandaHistory(
   countback = 500
 ): Promise<{ s: string; t: number[]; o: number[]; h: number[]; l: number[]; c: number[]; v: number[] }> {
   const oandaSym = toOandaSymbol(symbol);
+  const dispSym = toDisplaySymbol(oandaSym);
   const resUpper = resolution.trim().toUpperCase();
   const granularity = translateResolution(resUpper);
-  const is1s = ['1T', '3T', '5T', '1S', '3S', '5S'].includes(resUpper);
 
-  let count = countback;
-  if (is1s) {
-    count = Math.max(100, Math.min(Math.floor(countback / 5), 5000));
+  // Only 1S/1T and 3S/3T need sub-5s synthesis from OANDA's S5 candles.
+  // 5S, 10S, 15S, 30S are native OANDA granularities (S5, S10, S15, S30) and must NEVER be split into 1s!
+  const is1s = resUpper === '1S' || resUpper === '1T';
+  const is3s = resUpper === '3S' || resUpper === '3T';
+  const is3m = resUpper === '3';
+  const is45m = resUpper === '45';
+
+  const isPoll = countback <= 10;
+  let count: number;
+  if (isPoll) {
+    count = is1s || is3s ? 4 : is3m || is45m ? 8 : 3;
+  } else if (is1s) {
+    count = Math.max(100, Math.min(Math.ceil(countback / 5), 2500));
+  } else if (is3s) {
+    count = Math.max(100, Math.min(Math.ceil((countback * 3) / 5), 2500));
+  } else if (is3m || is45m) {
+    count = Math.max(150, Math.min(countback * 3, 5000));
   } else {
-    count = Math.max(50, Math.min(count, 5000));
+    count = Math.max(100, Math.min(countback, 5000));
   }
 
-  const nowSec = Math.floor(Date.now() / 1000);
-  const isPoll = countback <= 10;
-  const useTo = !isPoll && to > 0 && to < (nowSec - 172800);
+  const calibratedNowSec = getCalibratedServerTimeSec();
+  const useTo = !isPoll && to > 0 && to < (calibratedNowSec - 172800);
 
-  const cacheKey = `${oandaSym}|${resUpper}|${count}|${useTo ? Math.floor(to / 60) : 'live'}`;
+  const cacheKey = `${oandaSym}|${resUpper}|${isPoll ? 'poll' : count}|${useTo ? Math.floor(to / 60) : 'live'}`;
+  const ttlMs = isPoll ? 180 : 1000;
   const cached = historyCache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < (isPoll ? 750 : 1500)) {
+  if (cached && Date.now() - cached.ts < ttlMs) {
     return cached.data;
   }
 
-  let url = `/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`;
-  if (useTo) {
-    const toIso = new Date(to * 1000).toISOString();
-    url += `&to=${encodeURIComponent(toIso)}`;
-  }
+  const existingPromise = inFlightHistory.get(cacheKey);
+  if (existingPromise) return existingPromise;
 
-  let data: any;
-  try {
-    data = await oandaRequest(url);
-  } catch {
-    if (useTo) {
-      data = await oandaRequest(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
-    } else {
-      return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
-    }
-  }
-
-  if ((!data?.candles || data.candles.length === 0) && useTo) {
+  const task = (async () => {
     try {
-      data = await oandaRequest(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
-    } catch {
-      return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
-    }
-  }
-
-  const candles = data?.candles || [];
-  if (candles.length === 0) {
-    return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
-  }
-
-  const t: number[] = [];
-  const o: number[] = [];
-  const h: number[] = [];
-  const l: number[] = [];
-  const c: number[] = [];
-  const v: number[] = [];
-
-  for (const candle of candles) {
-    const mid = candle.mid;
-    if (!mid) continue;
-
-    const timeSec = Math.floor(new Date(candle.time).getTime() / 1000);
-    const oVal = parseFloat(mid.o);
-    const hVal = parseFloat(mid.h);
-    const lVal = parseFloat(mid.l);
-    const cVal = parseFloat(mid.c);
-    const vol = candle.volume || 1;
-
-    if (is1s) {
-      const pts = [oVal, lVal, (oVal + cVal) / 2, hVal, cVal];
-      const subVol = Math.max(1, Math.floor(vol / 5));
-      for (let i = 0; i < 5; i++) {
-        const sO = i === 0 ? pts[0] : pts[i - 1];
-        const sC = pts[i];
-        t.push(timeSec + i);
-        o.push(sO);
-        h.push(Math.max(sO, sC));
-        l.push(Math.min(sO, sC));
-        c.push(sC);
-        v.push(subVol);
+      let url = `/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`;
+      if (useTo) {
+        const toIso = new Date(to * 1000).toISOString();
+        url += `&to=${encodeURIComponent(toIso)}`;
       }
-    } else {
-      t.push(timeSec);
-      o.push(oVal);
-      h.push(hVal);
-      l.push(lVal);
-      c.push(cVal);
-      v.push(vol);
+
+      let data: any;
+      try {
+        data = await oandaRequest(url);
+      } catch {
+        if (useTo) {
+          data = await oandaRequest(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
+        } else {
+          return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
+        }
+      }
+
+      if ((!data?.candles || data.candles.length === 0) && useTo) {
+        try {
+          data = await oandaRequest(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
+        } catch {
+          return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
+        }
+      }
+
+      const candles = data?.candles || [];
+      if (candles.length === 0) {
+        return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
+      }
+
+      const nowSec = getCalibratedServerTimeSec();
+      const rawBars: RawBar[] = [];
+
+      for (let idx = 0; idx < candles.length; idx++) {
+        const candle = candles[idx];
+        const mid = candle.mid;
+        if (!mid) continue;
+
+        const isLastCandle = idx === candles.length - 1;
+        const timeSec = Math.floor(new Date(candle.time).getTime() / 1000);
+        const oVal = parseFloat(mid.o);
+        let hVal = parseFloat(mid.h);
+        let lVal = parseFloat(mid.l);
+        let cVal = parseFloat(mid.c);
+        const vol = candle.volume || 1;
+
+        // Incorporate latest live quote into the currently forming candle
+        if (isLastCandle) {
+          const liveQ = latestQuoteMap.get(dispSym);
+          if (liveQ && liveQ.lp > 0 && Date.now() - liveQ.timeMs < 5000) {
+            cVal = liveQ.lp;
+            hVal = Math.max(hVal, cVal);
+            lVal = Math.min(lVal, cVal);
+          }
+        }
+
+        if (is1s || is3s) {
+          // 6 boundary points so each 1s bar transitions smoothly from pts[i] -> pts[i+1]
+          const isBull = cVal >= oVal;
+          const p1 = isBull ? lVal : hVal;
+          const p2 = (oVal + cVal) * 0.5;
+          const p3 = isBull ? hVal : lVal;
+          const p4 = (p3 + cVal) * 0.5;
+          const pts = [oVal, p1, p2, p3, p4, cVal];
+          const subVol = Math.max(1, Math.round(vol / 5));
+
+          // For the currently forming S5 candle, NEVER emit future 1s bars ahead of calibrated server clock
+          const maxSubIdx = (!isLastCandle || candle.complete)
+            ? 4
+            : Math.min(4, Math.max(0, Math.floor(nowSec - timeSec)));
+
+          for (let i = 0; i <= maxSubIdx; i++) {
+            const sT = timeSec + i;
+            const sO = pts[i];
+            const sC = i === maxSubIdx ? cVal : pts[i + 1];
+            const sH = i === maxSubIdx ? Math.max(sO, sC) : Math.max(sO, sC);
+            const sL = i === maxSubIdx ? Math.min(sO, sC) : Math.min(sO, sC);
+            rawBars.push({ t: sT, o: sO, h: sH, l: sL, c: sC, v: subVol });
+          }
+        } else {
+          rawBars.push({ t: timeSec, o: oVal, h: hVal, l: lVal, c: cVal, v: vol });
+        }
+      }
+
+      let finalBars = rawBars;
+      if (is3s) {
+        finalBars = aggregateBars(rawBars, 3);
+      } else if (is3m) {
+        finalBars = aggregateBars(rawBars, 180);
+      } else if (is45m) {
+        finalBars = aggregateBars(rawBars, 2700);
+      }
+
+      // Ensure strict ascending timestamp uniqueness
+      const t: number[] = [];
+      const o: number[] = [];
+      const h: number[] = [];
+      const l: number[] = [];
+      const c: number[] = [];
+      const v: number[] = [];
+
+      for (const b of finalBars) {
+        if (t.length > 0 && b.t === t[t.length - 1]) {
+          const lastIdx = t.length - 1;
+          h[lastIdx] = Math.max(h[lastIdx], b.h);
+          l[lastIdx] = Math.min(l[lastIdx], b.l);
+          c[lastIdx] = b.c;
+          v[lastIdx] += b.v;
+        } else if (t.length === 0 || b.t > t[t.length - 1]) {
+          t.push(b.t);
+          o.push(b.o);
+          h.push(b.h);
+          l.push(b.l);
+          c.push(b.c);
+          v.push(b.v);
+        }
+      }
+
+      const result = t.length > 0
+        ? { s: 'ok', t, o, h, l, c, v }
+        : { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
+
+      historyCache.set(cacheKey, { ts: Date.now(), data: result });
+      return result;
+    } finally {
+      inFlightHistory.delete(cacheKey);
     }
-  }
+  })();
 
-  const result = t.length > 0
-    ? { s: 'ok', t, o, h, l, c, v }
-    : { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
-
-  historyCache.set(cacheKey, { ts: Date.now(), data: result });
-  return result;
+  inFlightHistory.set(cacheKey, task);
+  return task;
 }
 
 export async function fetchOandaQuotes(symbols: string[]): Promise<{ s: string; d: any[]; serverTimeMs?: number }> {
@@ -345,6 +474,10 @@ export async function fetchOandaQuotes(symbols: string[]): Promise<{ s: string; 
     const ask = parseFloat(p.asks?.[0]?.price || p.closeoutAsk || '0');
     const lp = bid > 0 && ask > 0 ? (bid + ask) / 2 : Math.max(bid, ask);
     const spread = Math.abs(ask - bid);
+
+    if (lp > 0) {
+      latestQuoteMap.set(dispSym, { lp, bid, ask, timeMs: Date.now() });
+    }
 
     const vObj = {
       lp,

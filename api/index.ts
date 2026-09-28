@@ -84,9 +84,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       has_intraday: true,
       has_seconds: true,
       has_ticks: true,
-      ticks_multipliers: ['1'],
-      seconds_multipliers: ['1', '5', '10', '15', '30'],
-      intraday_multipliers: ['1', '5', '15', '30', '60', '240'],
+      ticks_multipliers: ['1', '3', '10'],
+      seconds_multipliers: ['1', '3', '5', '10', '15', '30'],
+      intraday_multipliers: ['1', '2', '3', '4', '5', '10', '15', '30', '45', '60', '120', '180', '240'],
       daily_multipliers: ['1'],
       weekly_multipliers: ['1'],
       monthly_multipliers: ['1'],
@@ -119,11 +119,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         pricescale,
         minmov: 1,
         has_intraday: true,
-        intraday_multipliers: ['1', '5', '15', '30', '60', '240'],
+        intraday_multipliers: ['1', '2', '3', '4', '5', '10', '15', '30', '45', '60', '120', '180', '240'],
         has_seconds: true,
-        seconds_multipliers: ['1', '5', '10', '15', '30'],
+        seconds_multipliers: ['1', '3', '5', '10', '15', '30'],
         has_ticks: true,
-        ticks_multipliers: ['1'],
+        ticks_multipliers: ['1', '3', '10'],
         has_daily: true,
         daily_multipliers: ['1'],
         has_weekly_and_monthly: true,
@@ -151,16 +151,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       const oandaSym = toOandaSymbol(symbol);
-      const resUpper = resolution.toUpperCase();
-      const granularity = translateResolution(resolution);
-      const is1s = ['1T', '3T', '5T', '1S', '3S', '5S'].includes(resUpper);
+      const resUpper = resolution.trim().toUpperCase();
+      const granularity = translateResolution(resUpper);
+      const is1s = resUpper === '1S' || resUpper === '1T';
+      const is3s = resUpper === '3S' || resUpper === '3T';
 
-      const count = is1s
-        ? Math.max(100, Math.min(Math.floor(countback / 5), 5000))
-        : Math.max(50, Math.min(countback, 5000));
-
-      const nowSec = Math.floor(Date.now() / 1000);
       const isPoll = countback <= 10;
+      const count = isPoll
+        ? (is1s || is3s ? 4 : 3)
+        : (is1s || is3s
+            ? Math.max(100, Math.min(Math.ceil(countback / 5), 2500))
+            : Math.max(100, Math.min(countback, 5000)));
+
+      const nowSec = Date.now() / 1000;
       const useTo = !isPoll && toParam > 0 && toParam < (nowSec - 172800);
 
       let url = `/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`;
@@ -192,16 +195,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(200).json({ s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] });
       }
 
-      const t: number[] = [];
-      const o: number[] = [];
-      const h: number[] = [];
-      const l: number[] = [];
-      const c: number[] = [];
-      const v: number[] = [];
+      const rawBars: Array<{ t: number; o: number; h: number; l: number; c: number; v: number }> = [];
 
-      for (const candle of candles) {
+      for (let idx = 0; idx < candles.length; idx++) {
+        const candle = candles[idx];
         const mid = candle.mid;
         if (!mid) continue;
+        const isLast = idx === candles.length - 1;
         const timeSec = Math.floor(new Date(candle.time).getTime() / 1000);
         const oVal = parseFloat(mid.o);
         const hVal = parseFloat(mid.h);
@@ -209,32 +209,63 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const cVal = parseFloat(mid.c);
         const vol = candle.volume || 1;
 
-        if (is1s) {
-          const pts = [oVal, lVal, (oVal + cVal) / 2, hVal, cVal];
-          const subVol = Math.max(1, Math.floor(vol / 5));
-          for (let i = 0; i < 5; i++) {
-            const sO = i === 0 ? pts[0] : pts[i - 1];
-            const sC = pts[i];
-            t.push(timeSec + i);
-            o.push(sO);
-            h.push(Math.max(sO, sC));
-            l.push(Math.min(sO, sC));
-            c.push(sC);
-            v.push(subVol);
+        if (is1s || is3s) {
+          const isBull = cVal >= oVal;
+          const p1 = isBull ? lVal : hVal;
+          const p2 = (oVal + cVal) * 0.5;
+          const p3 = isBull ? hVal : lVal;
+          const p4 = (p3 + cVal) * 0.5;
+          const pts = [oVal, p1, p2, p3, p4, cVal];
+          const subVol = Math.max(1, Math.round(vol / 5));
+          const maxSubIdx = (!isLast || candle.complete)
+            ? 4
+            : Math.min(4, Math.max(0, Math.floor(nowSec - timeSec)));
+
+          for (let i = 0; i <= maxSubIdx; i++) {
+            const sO = pts[i];
+            const sC = i === maxSubIdx ? cVal : pts[i + 1];
+            rawBars.push({
+              t: timeSec + i,
+              o: sO,
+              h: Math.max(sO, sC),
+              l: Math.min(sO, sC),
+              c: sC,
+              v: subVol,
+            });
           }
         } else {
-          t.push(timeSec);
-          o.push(oVal);
-          h.push(hVal);
-          l.push(lVal);
-          c.push(cVal);
-          v.push(vol);
+          rawBars.push({ t: timeSec, o: oVal, h: hVal, l: lVal, c: cVal, v: vol });
+        }
+      }
+
+      const t: number[] = [];
+      const o: number[] = [];
+      const h: number[] = [];
+      const l: number[] = [];
+      const c: number[] = [];
+      const v: number[] = [];
+
+      for (const b of rawBars) {
+        const barTime = is3s ? Math.floor(b.t / 3) * 3 : b.t;
+        if (t.length > 0 && t[t.length - 1] === barTime) {
+          const li = t.length - 1;
+          h[li] = Math.max(h[li], b.h);
+          l[li] = Math.min(l[li], b.l);
+          c[li] = b.c;
+          v[li] += b.v;
+        } else if (t.length === 0 || barTime > t[t.length - 1]) {
+          t.push(barTime);
+          o.push(b.o);
+          h.push(b.h);
+          l.push(b.l);
+          c.push(b.c);
+          v.push(b.v);
         }
       }
 
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       return res.status(200).json(
-        t.length > 0 ? { s: 'ok', t, o, h, l, c, v } : { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] }
+        t.length > 0 ? { s: 'ok', t, o, h, l, c, v } : { s: 'no_data', t: [], o: [], h: [], c: [], l: [], v: [] }
       );
     } catch (err: any) {
       return res.status(500).json({ s: 'error', errmsg: err.message });

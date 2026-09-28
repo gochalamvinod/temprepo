@@ -1,18 +1,40 @@
 import type { WidgetOptions } from '../../types/tradingview';
-import { getCalibratedServerTimeSec, startSync } from '../../lib/serverTimeSync';
+import {
+  getCalibratedServerTimeSec,
+  startSync,
+  waitForInitialSync,
+} from '../../lib/serverTimeSync';
 import {
   SUPPORTED_RESOLUTIONS,
   resolveSymbolMetaSync,
   fetchOandaHistory,
   fetchOandaQuotes,
   fetchInstruments,
+  getResolutionSeconds,
+  latestQuoteMap,
+  toDisplaySymbol,
+  toOandaSymbol,
 } from '../../services/oandaClient';
+import { quoteWs } from '../../services/websocket';
 
 // Start OANDA-synced clock immediately on module load
 startSync();
 
+interface BarState {
+  time: number; // ms
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
 function createUniversalDatafeed(datafeedUrl: string) {
   const base = new (window as any).Datafeeds.UDFCompatibleDatafeed(datafeedUrl, 10);
+
+  // Track last valid bar per (symbol|resolution) to guarantee zero time-violation errors at 10ms UDF speed
+  const lastBarBySeries = new Map<string, BarState>();
+  const activeRealtimeCleanups = new Map<string, () => void>();
 
   // Override internal UDF requester for 0ms config/symbol/time resolution & 1-hop direct OANDA calls
   if (base._requester) {
@@ -29,15 +51,16 @@ function createUniversalDatafeed(datafeedUrl: string) {
             has_intraday: true,
             has_seconds: true,
             has_ticks: true,
-            ticks_multipliers: ['1'],
-            seconds_multipliers: ['1', '5', '10', '15', '30'],
-            intraday_multipliers: ['1', '5', '15', '30', '60', '240'],
+            ticks_multipliers: ['1', '3', '10'],
+            seconds_multipliers: ['1', '3', '5', '10', '15', '30'],
+            intraday_multipliers: ['1', '2', '3', '4', '5', '10', '15', '30', '45', '60', '120', '180', '240'],
             daily_multipliers: ['1'],
             weekly_multipliers: ['1'],
             monthly_multipliers: ['1'],
             default_symbol: 'XAUUSD',
           };
         case 'time':
+          await waitForInitialSync();
           return getCalibratedServerTimeSec();
         case 'symbols': {
           const sym = params?.symbol || 'XAUUSD';
@@ -56,11 +79,11 @@ function createUniversalDatafeed(datafeedUrl: string) {
             minmov: 1,
             pricescale,
             has_intraday: true,
-            intraday_multipliers: ['1', '5', '15', '30', '60', '240'],
+            intraday_multipliers: ['1', '2', '3', '4', '5', '10', '15', '30', '45', '60', '120', '180', '240'],
             has_seconds: true,
-            seconds_multipliers: ['1', '5', '10', '15', '30'],
+            seconds_multipliers: ['1', '3', '5', '10', '15', '30'],
             has_ticks: true,
-            ticks_multipliers: ['1'],
+            ticks_multipliers: ['1', '3', '10'],
             has_daily: true,
             daily_multipliers: ['1'],
             has_weekly_and_monthly: true,
@@ -120,9 +143,9 @@ function createUniversalDatafeed(datafeedUrl: string) {
           has_intraday: true,
           has_seconds: true,
           has_ticks: true,
-          ticks_multipliers: ['1'],
-          seconds_multipliers: ['1', '5', '10', '15', '30'],
-          intraday_multipliers: ['1', '5', '15', '30', '60', '240'],
+          ticks_multipliers: ['1', '3', '10'],
+          seconds_multipliers: ['1', '3', '5', '10', '15', '30'],
+          intraday_multipliers: ['1', '2', '3', '4', '5', '10', '15', '30', '45', '60', '120', '180', '240'],
           daily_multipliers: ['1'],
           weekly_multipliers: ['1'],
           monthly_multipliers: ['1'],
@@ -137,11 +160,11 @@ function createUniversalDatafeed(datafeedUrl: string) {
           onResolved({
             ...info,
             has_intraday: true,
-            intraday_multipliers: ['1', '5', '15', '30', '60', '240'],
+            intraday_multipliers: ['1', '2', '3', '4', '5', '10', '15', '30', '45', '60', '120', '180', '240'],
             has_seconds: true,
-            seconds_multipliers: ['1', '5', '10', '15', '30'],
+            seconds_multipliers: ['1', '3', '5', '10', '15', '30'],
             has_ticks: true,
-            ticks_multipliers: ['1'],
+            ticks_multipliers: ['1', '3', '10'],
             has_daily: true,
             daily_multipliers: ['1'],
             has_weekly_and_monthly: true,
@@ -155,29 +178,149 @@ function createUniversalDatafeed(datafeedUrl: string) {
     },
     getBars: (symbolInfo: any, resolution: string, periodParams: any, onHistory: any, onError: any) => {
       const effectiveRes = convertTicksToSeconds(resolution);
+      const dispSym = toDisplaySymbol(toOandaSymbol(symbolInfo?.ticker || symbolInfo?.name || 'XAUUSD'));
+      const seriesKey = `${dispSym}|${effectiveRes}`;
+
       return base.getBars(
         symbolInfo,
         effectiveRes,
         periodParams,
-        onHistory,
+        (bars: BarState[], meta: any) => {
+          if (Array.isArray(bars) && bars.length > 0) {
+            const last = bars[bars.length - 1];
+            const prev = lastBarBySeries.get(seriesKey);
+            if (periodParams?.firstDataRequest || !prev || last.time >= prev.time) {
+              lastBarBySeries.set(seriesKey, { ...last });
+            }
+          }
+          onHistory(bars, meta);
+        },
         onError
       );
     },
     subscribeBars: (symbolInfo: any, resolution: string, onRealtime: any, uid: string, onReset: any) => {
       const effectiveRes = convertTicksToSeconds(resolution);
+      const dispSym = toDisplaySymbol(toOandaSymbol(symbolInfo?.ticker || symbolInfo?.name || 'XAUUSD'));
+      const seriesKey = `${dispSym}|${effectiveRes}`;
+      const resSec = getResolutionSeconds(effectiveRes);
+
+      quoteWs.subscribe([dispSym]);
+
+      // Monotonic bar emitter: guarantees no time-violation errors and preserves intra-bar high/low wicks
+      const emitSafeBar = (incoming: BarState) => {
+        const last = lastBarBySeries.get(seriesKey);
+        // Do not emit realtime bars until initial getBars has seeded the series
+        if (!last) return;
+
+        if (incoming.time < last.time) {
+          return; // Drop stale out-of-order bar
+        }
+
+        if (incoming.time === last.time) {
+          const merged: BarState = {
+            time: last.time,
+            open: last.open,
+            high: Math.max(last.high, incoming.high, incoming.close),
+            low: Math.min(last.low, incoming.low, incoming.close),
+            close: incoming.close,
+            volume: Math.max(last.volume || 1, incoming.volume || 1),
+          };
+          lastBarBySeries.set(seriesKey, merged);
+          onRealtime(merged);
+        } else {
+          const nextBar: BarState = {
+            time: incoming.time,
+            open: incoming.open,
+            high: Math.max(incoming.open, incoming.high, incoming.close),
+            low: Math.min(incoming.open, incoming.low, incoming.close),
+            close: incoming.close,
+            volume: incoming.volume || 1,
+          };
+          lastBarBySeries.set(seriesKey, nextBar);
+          onRealtime(nextBar);
+        }
+      };
+
+      // Sub-second / second real-time clock-aligned bar ticker for instant live responsiveness
+      const tickTimer = window.setInterval(() => {
+        const last = lastBarBySeries.get(seriesKey);
+        if (!last) return;
+
+        const q = latestQuoteMap.get(dispSym);
+        const livePrice = q && q.lp > 0 ? q.lp : last.close;
+        if (!livePrice || livePrice <= 0) return;
+
+        if (resSec < 86400) {
+          const nowSec = getCalibratedServerTimeSec();
+          const alignedSec = Math.floor(nowSec / resSec) * resSec;
+          const alignedMs = alignedSec * 1000;
+
+          if (alignedMs >= last.time && alignedMs - last.time <= resSec * 10000) {
+            emitSafeBar({
+              time: alignedMs,
+              open: alignedMs > last.time ? last.close : last.open,
+              high: livePrice,
+              low: livePrice,
+              close: livePrice,
+              volume: last.volume || 1,
+            });
+          }
+        }
+      }, 200);
+
+      const unsubQuote = quoteWs.onQuote(q => {
+        if (q.symbol !== dispSym) return;
+        const last = lastBarBySeries.get(seriesKey);
+        if (!last) return;
+        const lp = q.data?.v?.lp;
+        if (!lp || lp <= 0) return;
+
+        const nowSec = getCalibratedServerTimeSec();
+        const alignedMs = resSec < 86400
+          ? Math.floor(nowSec / resSec) * resSec * 1000
+          : last.time;
+
+        if (alignedMs >= last.time) {
+          emitSafeBar({
+            time: alignedMs,
+            open: alignedMs > last.time ? last.close : last.open,
+            high: lp,
+            low: lp,
+            close: lp,
+            volume: (last.volume || 1) + 1,
+          });
+        }
+      });
+
+      const prevCleanup = activeRealtimeCleanups.get(uid);
+      if (prevCleanup) prevCleanup();
+      activeRealtimeCleanups.set(uid, () => {
+        clearInterval(tickTimer);
+        unsubQuote();
+      });
+
       return base.subscribeBars(
         symbolInfo,
         effectiveRes,
-        onRealtime,
+        emitSafeBar,
         uid,
         onReset
       );
     },
-    unsubscribeBars: base.unsubscribeBars.bind(base),
+    unsubscribeBars: (uid: string) => {
+      const cleanup = activeRealtimeCleanups.get(uid);
+      if (cleanup) {
+        cleanup();
+        activeRealtimeCleanups.delete(uid);
+      }
+      return base.unsubscribeBars(uid);
+    },
     getMarks: base.getMarks?.bind(base),
     getTimescaleMarks: base.getTimescaleMarks?.bind(base),
     getServerTime: (cb: (time: number) => void) => {
-      cb(getCalibratedServerTimeSec());
+      waitForInitialSync().then(() => {
+        cb(getCalibratedServerTimeSec());
+      });
     },
     getQuotes: base.getQuotes?.bind(base),
     subscribeQuotes: base.subscribeQuotes?.bind(base),
