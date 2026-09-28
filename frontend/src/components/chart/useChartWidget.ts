@@ -33,7 +33,17 @@ export function useChartWidget(
     // Pre-warm full OANDA instruments catalog in background without blocking 0ms widget boot
     fetchInstruments().catch(() => {});
 
-    setIsLoading(false);
+    // Reset stale cached watchlist in localStorage so only XAUUSD, XAGUSD, and EURUSD are shown
+    try {
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('tradingview.savedwatch.')) {
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(k => localStorage.removeItem(k));
+    } catch {}
 
     const adapter = saveLoadAdapter || new LocalStorageSaveLoadAdapter();
     const savedChartData = getSavedChartState();

@@ -21,8 +21,7 @@ export const SUPPORTED_RESOLUTIONS = [
 ];
 
 export const DEFAULT_WATCHLIST = [
-  'XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'BTCUSD', 'ETHUSD',
-  'XAGUSD', 'AUDUSD', 'USDCAD', 'USDCHF', 'SPX500USD', 'NAS100USD', 'US30USD', 'WTICOUSD',
+  'XAUUSD', 'XAGUSD', 'EURUSD',
 ];
 
 export interface InstrumentMeta {
