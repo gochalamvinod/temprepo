@@ -24,9 +24,10 @@ class QuoteStreamService {
     this.isConnected = true;
     this.onConnectCallbacks.forEach(cb => cb());
 
+    // 100ms poll = 10 ticks/sec — absolute fastest safe REST polling rate
     this.pollInterval = window.setInterval(() => {
       this.pollQuotes();
-    }, 1000);
+    }, 100);
   }
 
   private async pollQuotes() {

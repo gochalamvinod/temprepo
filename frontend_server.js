@@ -185,42 +185,62 @@ async function oandaFetch(subpath) {
   return res.json();
 }
 
-// ── Instant Instrument Metadata Table ────────────────────────────────────
-const INSTANT_META = {
-  XAU_USD: { name: 'XAU_USD', symbol: 'XAUUSD', displayName: 'Gold (XAU/USD)', type: 'METAL', displayPrecision: 3, pipLocation: -1 },
-  XAG_USD: { name: 'XAG_USD', symbol: 'XAGUSD', displayName: 'Silver (XAG/USD)', type: 'METAL', displayPrecision: 3, pipLocation: -3 },
-  BTC_USD: { name: 'BTC_USD', symbol: 'BTCUSD', displayName: 'Bitcoin (BTC/USD)', type: 'CFD', displayPrecision: 2, pipLocation: -2 },
-  ETH_USD: { name: 'ETH_USD', symbol: 'ETHUSD', displayName: 'Ethereum (ETH/USD)', type: 'CFD', displayPrecision: 2, pipLocation: -2 },
-  EUR_USD: { name: 'EUR_USD', symbol: 'EURUSD', displayName: 'EUR/USD', type: 'CURRENCY', displayPrecision: 5, pipLocation: -4 },
-  GBP_USD: { name: 'GBP_USD', symbol: 'GBPUSD', displayName: 'GBP/USD', type: 'CURRENCY', displayPrecision: 5, pipLocation: -4 },
-  USD_JPY: { name: 'USD_JPY', symbol: 'USDJPY', displayName: 'USD/JPY', type: 'CURRENCY', displayPrecision: 3, pipLocation: -2 },
-  USD_CHF: { name: 'USD_CHF', symbol: 'USDCHF', displayName: 'USD/CHF', type: 'CURRENCY', displayPrecision: 5, pipLocation: -4 },
-  AUD_USD: { name: 'AUD_USD', symbol: 'AUDUSD', displayName: 'AUD/USD', type: 'CURRENCY', displayPrecision: 5, pipLocation: -4 },
-  USD_CAD: { name: 'USD_CAD', symbol: 'USDCAD', displayName: 'USD/CAD', type: 'CURRENCY', displayPrecision: 5, pipLocation: -4 },
-  NZD_USD: { name: 'NZD_USD', symbol: 'NZDUSD', displayName: 'NZD/USD', type: 'CURRENCY', displayPrecision: 5, pipLocation: -4 },
-  SPX500_USD: { name: 'SPX500_USD', symbol: 'SPX500USD', displayName: 'US SPX 500', type: 'CFD', displayPrecision: 1, pipLocation: 0 },
-  NAS100_USD: { name: 'NAS100_USD', symbol: 'NAS100USD', displayName: 'US Nas 100', type: 'CFD', displayPrecision: 1, pipLocation: 0 },
-  US30_USD: { name: 'US30_USD', symbol: 'US30USD', displayName: 'US Wall St 30', type: 'CFD', displayPrecision: 1, pipLocation: 0 },
-  WTICO_USD: { name: 'WTICO_USD', symbol: 'WTICOUSD', displayName: 'West Texas Oil', type: 'CFD', displayPrecision: 3, pipLocation: -2 },
-};
+// ── Dynamic OANDA Instrument Catalog (Zero Hardcoding) ────────────────────
+let serverInstrumentsCache = null;
+let serverInstrumentsPromise = null;
 
-function resolveSymbolMeta(symbol) {
+async function fetchServerInstruments() {
+  if (serverInstrumentsCache) return serverInstrumentsCache;
+  if (serverInstrumentsPromise) return serverInstrumentsPromise;
+
+  serverInstrumentsPromise = (async () => {
+    try {
+      const data = await oandaFetch('/v3/accounts/{id}/instruments');
+      const map = new Map();
+      for (const inst of (data.instruments || [])) {
+        const disp = toDisplaySymbol(inst.name);
+        const meta = {
+          name: inst.name,
+          symbol: disp,
+          displayName: inst.displayName || disp,
+          type: inst.type || 'CURRENCY',
+          displayPrecision: inst.displayPrecision !== undefined ? inst.displayPrecision : 5,
+          pipLocation: inst.pipLocation !== undefined ? inst.pipLocation : -4,
+          minimumTradeSize: inst.minimumTradeSize || '1',
+          maximumOrderUnits: inst.maximumOrderUnits || '100000000',
+        };
+        map.set(inst.name, meta);
+        map.set(disp, meta);
+      }
+      serverInstrumentsCache = map;
+      return map;
+    } catch (e) {
+      console.warn('[SERVER] Could not fetch instruments catalog:', e.message);
+      return new Map();
+    }
+  })();
+
+  return serverInstrumentsPromise;
+}
+
+// Pre-warm instruments catalog on server startup
+fetchServerInstruments().catch(() => {});
+
+async function resolveSymbolMeta(symbol) {
   const oandaSym = toOandaSymbol(symbol);
-  if (INSTANT_META[oandaSym]) return INSTANT_META[oandaSym];
+  const cache = await fetchServerInstruments();
+  const hit = cache.get(oandaSym) || cache.get(toDisplaySymbol(oandaSym));
+  if (hit) return hit;
 
   const isJpy = oandaSym.endsWith('_JPY');
   const isMetal = oandaSym.startsWith('XAU') || oandaSym.startsWith('XAG');
-  const displayPrecision = isMetal || isJpy ? 3 : 5;
-  const pipLocation = isMetal ? -1 : isJpy ? -2 : -4;
-  const disp = toDisplaySymbol(oandaSym);
-
   return {
     name: oandaSym,
-    symbol: disp,
+    symbol: toDisplaySymbol(oandaSym),
     displayName: oandaSym.replace('_', '/'),
     type: isMetal ? 'METAL' : 'CURRENCY',
-    displayPrecision,
-    pipLocation,
+    displayPrecision: isMetal || isJpy ? 3 : 5,
+    pipLocation: isMetal ? -1 : isJpy ? -2 : -4,
   };
 }
 
@@ -551,7 +571,7 @@ async function handleConfig(req, res) {
 
 async function handleSymbols(req, res, query) {
   const symbol = query.symbol || 'XAUUSD';
-  const meta = resolveSymbolMeta(symbol);
+  const meta = await resolveSymbolMeta(symbol);
   const pricescale = Math.pow(10, meta.displayPrecision);
 
   res.writeHead(200, {
@@ -565,7 +585,7 @@ async function handleSymbols(req, res, query) {
     full_name: `OANDA:${meta.symbol}`,
     description: `${meta.displayName} (${meta.type})`,
     type: meta.type === 'CURRENCY' ? 'forex' : 'cfd',
-    session: '24x7',
+    session: (meta.symbol.startsWith('BTC') || meta.symbol.startsWith('ETH') || meta.symbol.startsWith('LTC') || meta.symbol.startsWith('SOL')) ? '24x7' : '2200-2200:12345',
     timezone: 'Etc/UTC',
     exchange: 'OANDA',
     listed_exchange: 'OANDA',
@@ -606,31 +626,34 @@ async function handleHistory(req, res, query) {
     const granularity = translateResolution(resolution);
     const is1s = ['1T', '3T', '5T', '1S', '3S', '5S'].includes(resUpper);
 
-    let count = countback;
-    if (is1s) {
-      count = Math.max(100, Math.min(Math.floor(countback / 5), 5000));
+    const nowSec = Math.floor(Date.now() / 1000);
+    const firstDataRequest =
+      query.firstDataRequest === undefined
+        ? countback > 10 && (!toParam || toParam >= nowSec - 60)
+        : query.firstDataRequest === 'true';
+    const isPoll = countback <= 10 && !firstDataRequest;
+
+    let count;
+    if (isPoll) {
+      count = is1s ? 4 : 3;
+    } else if (is1s) {
+      count = Math.max(100, Math.min(Math.ceil(countback / 5), 2500));
     } else {
-      count = Math.max(50, Math.min(count, 5000));
+      count = Math.max(100, Math.min(countback, 5000));
     }
 
-    const nowSec = Math.floor(Date.now() / 1000);
-    const isPoll = countback <= 10;
-    const useTo = !isPoll && toParam > 0 && toParam < (nowSec - 172800);
+    const useTo = !firstDataRequest && !isPoll && toParam > 0 && toParam < (nowSec - 5);
 
     let subpath = `/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`;
     if (useTo) {
-      subpath += `&to=${encodeURIComponent(new Date(toParam * 1000).toISOString())}`;
+      subpath += `&to=${encodeURIComponent(new Date(Math.max(1, toParam - 1) * 1000).toISOString())}`;
     }
 
     let data;
     try {
       data = await oandaFetch(subpath);
     } catch {
-      if (useTo) {
-        data = await oandaFetch(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
-      } else {
-        data = { candles: [] };
-      }
+      data = { candles: [] };
     }
 
     const candles = data?.candles || [];
@@ -641,6 +664,8 @@ async function handleHistory(req, res, query) {
       if (!mid) continue;
 
       const timeSec = Math.floor(new Date(candle.time).getTime() / 1000);
+      if (useTo && timeSec >= toParam) continue;
+
       const oVal = parseFloat(mid.o);
       const hVal = parseFloat(mid.h);
       const lVal = parseFloat(mid.l);
@@ -748,16 +773,8 @@ async function handleInstruments(req, res) {
     });
     res.end(JSON.stringify({ instruments }));
   } catch (err) {
-    const fallback = Object.values(INSTANT_META).map((m) => ({
-      symbol: m.symbol,
-      oanda_name: m.name,
-      type: m.type,
-      display_name: m.displayName,
-      pip: Math.pow(10, m.pipLocation),
-      display_precision: m.displayPrecision,
-      min_trade_size: '1',
-      max_trade_size: '100000000',
-    }));
+    const cache = await fetchServerInstruments();
+    const fallback = Array.from(cache.values()).filter((v, i, a) => a.findIndex(t => t.symbol === v.symbol) === i);
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ instruments: fallback }));
   }
@@ -783,7 +800,8 @@ async function handleSearch(req, res, query) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify(results));
   } catch {
-    const results = Object.values(INSTANT_META)
+    const cache = await fetchServerInstruments();
+    const results = Array.from(cache.values())
       .filter((m) => !q || m.symbol.includes(q) || m.name.includes(q))
       .slice(0, limit)
       .map((m) => ({
@@ -842,7 +860,7 @@ function proxyToViteOrFallback(req, res, pathname) {
 }
 
 // ── Master HTTP Request Router ──────────────────────────────────────────
-function handleHttpRequest(req, res) {
+async function handleHttpRequest(req, res) {
   // Global CORS Preflight Handler
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -911,6 +929,26 @@ function handleHttpRequest(req, res) {
   }
   if (pathname === '/search' || pathname === '/api/search') {
     return handleSearch(req, res, query);
+  }
+
+  // 2b. Direct /v3/* OANDA Proxy Endpoint (Zero CORS restrictions)
+  if (pathname.startsWith('/v3/')) {
+    try {
+      const data = await oandaFetch(req.url);
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+      });
+      res.end(JSON.stringify(data));
+    } catch (err) {
+      res.writeHead(500, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
   }
 
   // 3. CDN Fallback Direct API Endpoint (/api/cdn)

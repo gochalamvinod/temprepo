@@ -348,6 +348,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  // 7b. Direct OANDA v3 Proxy (Server-side zero-CORS access)
+  if (route === 'v3' || route.startsWith('v3/')) {
+    const rawPath = Array.isArray(req.query.path)
+      ? req.query.path.join('/')
+      : (req.query.path as string || route.replace(/^v3\/?/, ''));
+    try {
+      const data = await oandaFetch(`/v3/${rawPath}`);
+      return res.status(200).json(data);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   // 8. Compulsory TradingView CDN Proxy Fallback
   if (route === 'cdn' || route.startsWith('cdn/')) {
     const rawPath = Array.isArray(req.query.path)

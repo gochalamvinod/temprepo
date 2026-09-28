@@ -80,7 +80,7 @@ export function useChartWidget(
         } catch (e) {
           console.warn('Auto-save failed', e);
         }
-      }, 500);
+      }, 1000);
     };
 
     const triggerSaveSync = () => {
@@ -135,10 +135,11 @@ export function useChartWidget(
           (chart as any).onSymbolChanged?.().subscribe(null, triggerSave);
         } catch {}
 
-        // Periodic auto-save every 5 seconds to guarantee drawing persistence
-        const periodicSaveInterval = setInterval(triggerSave, 5000);
+        // Periodic auto-save every 15 seconds — drawings save on interaction anyway
+        const periodicSaveInterval = setInterval(triggerSave, 15000);
 
         setIsReady(true);
+        setIsLoading(false);
 
         return () => {
           clearInterval(periodicSaveInterval);

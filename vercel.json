@@ -10,6 +10,7 @@
     { "source": "/quotes", "destination": "/api?route=quotes" },
     { "source": "/instruments", "destination": "/api?route=instruments" },
     { "source": "/trade/:subpath*", "destination": "/api?route=trade&subpath=:subpath*" },
+    { "source": "/v3/:path*", "destination": "/api?route=v3&path=:path*" },
     { "source": "/bundles/:path*", "destination": "/api?route=cdn&path=bundles/:path*" },
     { "source": "/charting_library/:path*", "destination": "/api?route=cdn&path=charting_library/:path*" },
     { "source": "/api/cdn", "destination": "/api?route=cdn" },

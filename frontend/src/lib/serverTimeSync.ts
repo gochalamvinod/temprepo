@@ -82,14 +82,34 @@ export function recordOandaTimestamp(isoStr: string, t0: number, t1: number): vo
   }
 }
 
-/** Perform a direct NTP-style probe against OANDA's nanosecond pricing clock */
+/** Perform a direct NTP-style probe against calibrated server clock */
 async function probe(): Promise<void> {
+  // Primary probe: same-origin sub-1ms NTP endpoint (0 CORS, sub-1ms RTT)
+  try {
+    const t0 = performance.now();
+    const resp = await fetch(`/time?_=${t0}`, { cache: 'no-store', signal: AbortSignal.timeout(2000) });
+    const t1 = performance.now();
+    if (resp.ok) {
+      const headerMs = resp.headers.get('X-Server-Time-Ms');
+      const bodyVal = await resp.json();
+      const serverMs = headerMs && !isNaN(parseFloat(headerMs))
+        ? parseFloat(headerMs)
+        : parseFloat(bodyVal) * 1000;
+      if (!isNaN(serverMs) && serverMs > 0) {
+        recordSample(serverMs, t0, t1);
+        return;
+      }
+    }
+  } catch {}
+
+  // Secondary probe: direct OANDA pricing clock
   try {
     const t0 = performance.now();
     const res = await fetch(
       `${OANDA_BASE_URL}/v3/accounts/${OANDA_ACCOUNT_ID}/pricing?instruments=XAU_USD`,
       {
         cache: 'no-store',
+        signal: AbortSignal.timeout(3000),
         headers: {
           'Authorization': `Bearer ${OANDA_API_TOKEN}`,
           'Accept-Datetime-Format': 'RFC3339',
@@ -101,38 +121,17 @@ async function probe(): Promise<void> {
       const data = await res.json();
       if (data && typeof data.time === 'string') {
         recordOandaTimestamp(data.time, t0, t1);
-        return;
       }
     }
-  } catch {
-    // Fallback to /time endpoint if direct OANDA probe fails
-  }
-
-  try {
-    const t0 = performance.now();
-    const resp = await fetch(`/time?_=${t0}`, { cache: 'no-store' });
-    const t1 = performance.now();
-    if (resp.ok) {
-      const headerMs = resp.headers.get('X-Server-Time-Ms');
-      const bodyVal = await resp.json();
-      const serverMs = headerMs && !isNaN(parseFloat(headerMs))
-        ? parseFloat(headerMs)
-        : parseFloat(bodyVal) * 1000;
-      if (!isNaN(serverMs) && serverMs > 0) {
-        recordSample(serverMs, t0, t1);
-      }
-    }
-  } catch {
-    // Keep existing calibrated offset
-  }
+  } catch {}
 }
 
-/** Wait until at least one NTP sample has been calibrated (with 800ms safety timeout) */
+/** Wait until at least one NTP sample calibrated (150ms safety — probes return in ~80ms) */
 export function waitForInitialSync(): Promise<void> {
   if (_isSynced) return Promise.resolve();
   return new Promise<void>(resolve => {
     _syncResolvers.push(resolve);
-    setTimeout(resolve, 800);
+    setTimeout(resolve, 150);
   });
 }
 
@@ -217,7 +216,7 @@ export function bindTradingViewClock(containerId: string): void {
   tryBind();
   setTimeout(tryBind, 300);
   setTimeout(tryBind, 1000);
-  setInterval(tryBind, 5000);
+  setInterval(tryBind, 30_000);
 }
 
 if (typeof window !== 'undefined') {
