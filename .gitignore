@@ -1,14 +1,15 @@
 # Dependencies
-node_modules/
-frontend/node_modules/
+/node_modules/
+/frontend/node_modules/
 
 # Agent Workspaces & Logs
 .agents/
 *.log
 
 # Build outputs
-target/
-dist/
+/target/
+/dist/
+/frontend/dist/
 
 # OS / Editor
 .DS_Store
