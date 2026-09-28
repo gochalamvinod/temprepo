@@ -284,10 +284,10 @@ export async function fetchOandaHistory(
   resolution: string,
   _from: number,
   to: number,
-  countback = 500
+  countback = 500,
+  firstDataRequest = true
 ): Promise<{ s: string; t: number[]; o: number[]; h: number[]; l: number[]; c: number[]; v: number[] }> {
   const oandaSym = toOandaSymbol(symbol);
-  const dispSym = toDisplaySymbol(oandaSym);
   const resUpper = resolution.trim().toUpperCase();
   const granularity = translateResolution(resUpper);
 
@@ -298,10 +298,10 @@ export async function fetchOandaHistory(
   const is3m = resUpper === '3';
   const is45m = resUpper === '45';
 
-  const isPoll = countback <= 10;
+  const isPoll = countback <= 10 && !firstDataRequest;
   let count: number;
   if (isPoll) {
-    count = is1s || is3s ? 4 : is3m || is45m ? 8 : 3;
+    count = is1s || is3s ? 4 : is3m || is45m ? 6 : 3;
   } else if (is1s) {
     count = Math.max(100, Math.min(Math.ceil(countback / 5), 2500));
   } else if (is3s) {
@@ -313,9 +313,10 @@ export async function fetchOandaHistory(
   }
 
   const calibratedNowSec = getCalibratedServerTimeSec();
-  const useTo = !isPoll && to > 0 && to < (calibratedNowSec - 172800);
+  // Use `to` whenever loading historical scrollback chunks (not initial load and not live poll)
+  const useTo = !firstDataRequest && !isPoll && to > 0 && to < (calibratedNowSec - 5);
 
-  const cacheKey = `${oandaSym}|${resUpper}|${isPoll ? 'poll' : count}|${useTo ? Math.floor(to / 60) : 'live'}`;
+  const cacheKey = `${oandaSym}|${resUpper}|${isPoll ? 'poll' : count}|${useTo ? to : 'latest'}`;
   const ttlMs = isPoll ? 180 : 1000;
   const cached = historyCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < ttlMs) {
@@ -329,7 +330,7 @@ export async function fetchOandaHistory(
     try {
       let url = `/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`;
       if (useTo) {
-        const toIso = new Date(to * 1000).toISOString();
+        const toIso = new Date(Math.max(1, to - 1) * 1000).toISOString();
         url += `&to=${encodeURIComponent(toIso)}`;
       }
 
@@ -337,19 +338,7 @@ export async function fetchOandaHistory(
       try {
         data = await oandaRequest(url);
       } catch {
-        if (useTo) {
-          data = await oandaRequest(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
-        } else {
-          return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
-        }
-      }
-
-      if ((!data?.candles || data.candles.length === 0) && useTo) {
-        try {
-          data = await oandaRequest(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
-        } catch {
-          return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
-        }
+        return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
       }
 
       const candles = data?.candles || [];
@@ -357,6 +346,8 @@ export async function fetchOandaHistory(
         return { s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] };
       }
 
+      const dispSym = toDisplaySymbol(oandaSym);
+      const liveQ = latestQuoteMap.get(dispSym);
       const nowSec = getCalibratedServerTimeSec();
       const rawBars: RawBar[] = [];
 
@@ -367,24 +358,24 @@ export async function fetchOandaHistory(
 
         const isLastCandle = idx === candles.length - 1;
         const timeSec = Math.floor(new Date(candle.time).getTime() / 1000);
+        // Strictly ignore any candle timestamp >= `to` when fetching historical scrollback
+        if (useTo && timeSec >= to) continue;
+
         const oVal = parseFloat(mid.o);
         let hVal = parseFloat(mid.h);
         let lVal = parseFloat(mid.l);
         let cVal = parseFloat(mid.c);
         const vol = candle.volume || 1;
 
-        // Incorporate latest live quote into the currently forming candle
-        if (isLastCandle) {
-          const liveQ = latestQuoteMap.get(dispSym);
-          if (liveQ && liveQ.lp > 0 && Date.now() - liveQ.timeMs < 5000) {
-            cVal = liveQ.lp;
-            hVal = Math.max(hVal, cVal);
-            lVal = Math.min(lVal, cVal);
-          }
+        // ONLY blend live quote on real-time 10ms UDF poll (`isPoll === true`) for an incomplete active candle.
+        // NEVER blend live quote on historical `getBars` (`!isPoll`), preventing boundary spikes!
+        if (isPoll && isLastCandle && !candle.complete && liveQ && liveQ.lp > 0 && Date.now() - liveQ.timeMs < 5000) {
+          cVal = liveQ.lp;
+          hVal = Math.max(hVal, cVal);
+          lVal = Math.min(lVal, cVal);
         }
 
         if (is1s || is3s) {
-          // 6 boundary points so each 1s bar transitions smoothly from pts[i] -> pts[i+1]
           const isBull = cVal >= oVal;
           const p1 = isBull ? lVal : hVal;
           const p2 = (oVal + cVal) * 0.5;
@@ -393,17 +384,18 @@ export async function fetchOandaHistory(
           const pts = [oVal, p1, p2, p3, p4, cVal];
           const subVol = Math.max(1, Math.round(vol / 5));
 
-          // For the currently forming S5 candle, NEVER emit future 1s bars ahead of calibrated server clock
-          const maxSubIdx = (!isLastCandle || candle.complete)
+          // For the currently forming S5 candle on initial/live load, never emit future 1s bars ahead of server clock
+          const maxSubIdx = (useTo || !isLastCandle || candle.complete)
             ? 4
             : Math.min(4, Math.max(0, Math.floor(nowSec - timeSec)));
 
           for (let i = 0; i <= maxSubIdx; i++) {
             const sT = timeSec + i;
+            if (useTo && sT >= to) break;
             const sO = pts[i];
             const sC = i === maxSubIdx ? cVal : pts[i + 1];
-            const sH = i === maxSubIdx ? Math.max(sO, sC) : Math.max(sO, sC);
-            const sL = i === maxSubIdx ? Math.min(sO, sC) : Math.min(sO, sC);
+            const sH = Math.max(sO, sC);
+            const sL = Math.min(sO, sC);
             rawBars.push({ t: sT, o: sO, h: sH, l: sL, c: sC, v: subVol });
           }
         } else {
@@ -418,6 +410,9 @@ export async function fetchOandaHistory(
         finalBars = aggregateBars(rawBars, 180);
       } else if (is45m) {
         finalBars = aggregateBars(rawBars, 2700);
+      }
+      if (useTo) {
+        finalBars = finalBars.filter(b => b.t < to);
       }
 
       // Ensure strict ascending timestamp uniqueness

@@ -156,7 +156,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const is1s = resUpper === '1S' || resUpper === '1T';
       const is3s = resUpper === '3S' || resUpper === '3T';
 
-      const isPoll = countback <= 10;
+      const firstDataRequest =
+        req.query.firstDataRequest === undefined
+          ? countback > 10 && (!toParam || toParam >= Date.now() / 1000 - 60)
+          : req.query.firstDataRequest === 'true';
+      const isPoll = countback <= 10 && !firstDataRequest;
       const count = isPoll
         ? (is1s || is3s ? 4 : 3)
         : (is1s || is3s
@@ -164,30 +168,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             : Math.max(100, Math.min(countback, 5000)));
 
       const nowSec = Date.now() / 1000;
-      const useTo = !isPoll && toParam > 0 && toParam < (nowSec - 172800);
+      const useTo = !firstDataRequest && !isPoll && toParam > 0 && toParam < (nowSec - 5);
 
       let url = `/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`;
       if (useTo) {
-        url += `&to=${encodeURIComponent(new Date(toParam * 1000).toISOString())}`;
+        url += `&to=${encodeURIComponent(new Date(Math.max(1, toParam - 1) * 1000).toISOString())}`;
       }
 
       let data: any;
       try {
         data = await oandaFetch(url);
       } catch {
-        if (useTo) {
-          data = await oandaFetch(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
-        } else {
-          return res.status(200).json({ s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] });
-        }
-      }
-
-      if ((!data?.candles || data.candles.length === 0) && useTo) {
-        try {
-          data = await oandaFetch(`/v3/instruments/${oandaSym}/candles?granularity=${granularity}&count=${count}&price=M`);
-        } catch {
-          return res.status(200).json({ s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] });
-        }
+        return res.status(200).json({ s: 'no_data', t: [], o: [], h: [], l: [], c: [], v: [] });
       }
 
       const candles = data?.candles || [];
@@ -203,6 +195,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         if (!mid) continue;
         const isLast = idx === candles.length - 1;
         const timeSec = Math.floor(new Date(candle.time).getTime() / 1000);
+        if (useTo && timeSec >= toParam) continue;
         const oVal = parseFloat(mid.o);
         const hVal = parseFloat(mid.h);
         const lVal = parseFloat(mid.l);
@@ -217,15 +210,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           const p4 = (p3 + cVal) * 0.5;
           const pts = [oVal, p1, p2, p3, p4, cVal];
           const subVol = Math.max(1, Math.round(vol / 5));
-          const maxSubIdx = (!isLast || candle.complete)
+          const maxSubIdx = (useTo || !isLast || candle.complete)
             ? 4
             : Math.min(4, Math.max(0, Math.floor(nowSec - timeSec)));
 
           for (let i = 0; i <= maxSubIdx; i++) {
+            const sT = timeSec + i;
+            if (useTo && sT >= toParam) break;
             const sO = pts[i];
             const sC = i === maxSubIdx ? cVal : pts[i + 1];
             rawBars.push({
-              t: timeSec + i,
+              t: sT,
               o: sO,
               h: Math.max(sO, sC),
               l: Math.min(sO, sC),

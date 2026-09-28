@@ -219,3 +219,14 @@ export function bindTradingViewClock(containerId: string): void {
   setTimeout(tryBind, 1000);
   setInterval(tryBind, 5000);
 }
+
+if (typeof window !== 'undefined') {
+  (window as any).__serverClockSync = {
+    getCalibratedServerTimeMs,
+    getCalibratedServerTimeSec,
+    getOffset,
+    getOffsetSec: () => getOffset() / 1000,
+    isSynced,
+    getSyncStats,
+  };
+}
